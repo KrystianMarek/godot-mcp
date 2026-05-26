@@ -61,6 +61,10 @@ func _init():
             create_scene(params)
         "add_node":
             add_node(params)
+        "set_node_property":
+            set_node_property(params)
+        "list_scene_nodes":
+            list_scene_nodes(params)
         "load_sprite":
             load_sprite(params)
         "export_mesh_library":
@@ -160,6 +164,87 @@ func instantiate_class(name_of_class):
         print("Successfully instantiated class: " + name_of_class + " of type: " + result.get_class())
     
     return result
+
+# Coerce a JSON-decoded value into a Godot Variant suitable for `node.set()`.
+#
+# Accepted shapes (in addition to plain scalars passed through unchanged):
+#   "res://path/to/asset.tres"
+#       Loaded via load().
+#   { "_type": "Vector3", "_args": [x, y, z] }
+#       Constructed via the matching built-in math constructor.
+#       Supported: Vector2, Vector2i, Vector3, Vector3i, Vector4, Color,
+#       Transform2D, Transform3D, Basis, Quaternion, Rect2, Rect2i, Plane.
+#   { "_type": "BoxShape3D", "_props": { "size": { "_type": "Vector3", "_args": [2,2,2] } } }
+#       Instantiated via ClassDB and each entry of `_props` is recursively coerced
+#       and applied via `set()`. Used to inline sub-resources such as meshes,
+#       shapes, environments and materials inside `add_node`.
+func coerce_value(value):
+    if typeof(value) == TYPE_STRING and value.begins_with("res://"):
+        return load(value)
+    if typeof(value) != TYPE_DICTIONARY or not value.has("_type"):
+        return value
+
+    var type_name = value["_type"]
+
+    if value.has("_args"):
+        var a = value["_args"]
+        match type_name:
+            "Vector2":
+                return Vector2(a[0], a[1])
+            "Vector2i":
+                return Vector2i(int(a[0]), int(a[1]))
+            "Vector3":
+                return Vector3(a[0], a[1], a[2])
+            "Vector3i":
+                return Vector3i(int(a[0]), int(a[1]), int(a[2]))
+            "Vector4":
+                return Vector4(a[0], a[1], a[2], a[3])
+            "Color":
+                if a.size() == 3:
+                    return Color(a[0], a[1], a[2])
+                return Color(a[0], a[1], a[2], a[3])
+            "Quaternion":
+                return Quaternion(a[0], a[1], a[2], a[3])
+            "Plane":
+                return Plane(a[0], a[1], a[2], a[3])
+            "Rect2":
+                return Rect2(a[0], a[1], a[2], a[3])
+            "Rect2i":
+                return Rect2i(int(a[0]), int(a[1]), int(a[2]), int(a[3]))
+            "Basis":
+                return Basis(
+                    Vector3(a[0], a[1], a[2]),
+                    Vector3(a[3], a[4], a[5]),
+                    Vector3(a[6], a[7], a[8])
+                )
+            "Transform2D":
+                return Transform2D(
+                    Vector2(a[0], a[1]),
+                    Vector2(a[2], a[3]),
+                    Vector2(a[4], a[5])
+                )
+            "Transform3D":
+                return Transform3D(
+                    Basis(
+                        Vector3(a[0], a[1], a[2]),
+                        Vector3(a[3], a[4], a[5]),
+                        Vector3(a[6], a[7], a[8])
+                    ),
+                    Vector3(a[9], a[10], a[11])
+                )
+            "NodePath":
+                return NodePath(a[0])
+
+    # Fall through: treat as a Resource/Object subclass and instantiate via ClassDB.
+    var sub = instantiate_class(type_name)
+    if sub == null:
+        printerr("coerce_value: failed to instantiate sub-resource type: " + type_name)
+        return null
+    if value.has("_props"):
+        var sub_props = value["_props"]
+        for sub_prop in sub_props:
+            sub.set(sub_prop, coerce_value(sub_props[sub_prop]))
+    return sub
 
 # Create a new scene with a specified root node type
 func create_scene(params):
@@ -514,15 +599,29 @@ func add_node(params):
         if debug_mode:
             print("Setting properties on node")
         var properties = params.properties
+        # Some MCP clients serialize nested objects as JSON strings instead of
+        # passing them through as parsed dicts. Detect that and re-parse so the
+        # property loop below always sees a Dictionary.
+        if typeof(properties) == TYPE_STRING:
+            if debug_mode:
+                print("properties arrived as a string, parsing as JSON")
+            var props_json = JSON.new()
+            var props_err = props_json.parse(properties)
+            if props_err != OK:
+                printerr("Failed to parse properties JSON: " + props_json.get_error_message())
+                properties = {}
+            else:
+                properties = props_json.get_data()
+        if typeof(properties) != TYPE_DICTIONARY:
+            printerr("Expected properties to be a Dictionary, got: " + str(typeof(properties)))
+            properties = {}
         for property in properties:
             if debug_mode:
                 print("Setting property: " + property + " = " + str(properties[property]))
-            var value = properties[property]
-            if typeof(value) == TYPE_STRING and value.begins_with("res://"):
-                value = load(value)
-                if debug_mode:
-                    print("Loaded resource for property: " + property + " -> " + str(value))
-            new_node.set(property, value)
+            var coerced = coerce_value(properties[property])
+            if debug_mode:
+                print("Coerced value for " + property + " -> " + str(coerced))
+            new_node.set(property, coerced)
     
     parent.add_child(new_node)
     new_node.owner = scene_root
@@ -554,6 +653,138 @@ func add_node(params):
             printerr("Failed to save scene: " + str(save_error))
     else:
         printerr("Failed to pack scene: " + str(result))
+
+# Resolve a node within an instantiated scene tree from an MCP-style node path.
+# Accepts "root", "root/Child", or "Child" (relative to scene root). Returns null
+# if the node cannot be found.
+func resolve_node(scene_root, node_path):
+    if node_path == null or node_path == "" or node_path == "root":
+        return scene_root
+    var relative = node_path
+    if relative.begins_with("root/"):
+        relative = relative.substr(5)
+    if relative == "":
+        return scene_root
+    return scene_root.get_node_or_null(NodePath(relative))
+
+# Set a single property on an existing node in a saved scene, then re-pack
+# and save. Supports the same coercion grammar as add_node.properties:
+# scalars, "res://..." loads, {_type,_args} math constructors, and
+# {_type,_props} sub-resource directives.
+func set_node_property(params):
+    print("Setting property on scene: " + params.scene_path)
+
+    var full_scene_path = params.scene_path
+    if not full_scene_path.begins_with("res://"):
+        full_scene_path = "res://" + full_scene_path
+    var absolute_scene_path = ProjectSettings.globalize_path(full_scene_path)
+
+    if not FileAccess.file_exists(absolute_scene_path):
+        printerr("Scene file does not exist at: " + absolute_scene_path)
+        quit(1)
+
+    var scene = load(full_scene_path)
+    if not scene:
+        printerr("Failed to load scene: " + full_scene_path)
+        quit(1)
+
+    var scene_root = scene.instantiate()
+    var node_path = ""
+    if params.has("node_path"):
+        node_path = params.node_path
+
+    var target = resolve_node(scene_root, node_path)
+    if target == null:
+        printerr("Node not found: " + node_path)
+        quit(1)
+    if debug_mode:
+        print("Target node: " + target.name + " (" + target.get_class() + ")")
+
+    if not params.has("property"):
+        printerr("Missing required parameter: property")
+        quit(1)
+
+    var property_name = params.property
+    var raw_value = params.value if params.has("value") else null
+    if debug_mode:
+        print("Setting property: " + property_name + " = " + str(raw_value))
+    var coerced = coerce_value(raw_value)
+    if debug_mode:
+        print("Coerced value: " + str(coerced))
+    target.set(property_name, coerced)
+
+    var packed_scene = PackedScene.new()
+    var pack_result = packed_scene.pack(scene_root)
+    if pack_result != OK:
+        printerr("Failed to pack scene: " + str(pack_result))
+        quit(1)
+
+    var save_error = ResourceSaver.save(packed_scene, absolute_scene_path)
+    if save_error != OK:
+        printerr("Failed to save scene: " + str(save_error))
+        quit(1)
+
+    print("Property '" + property_name + "' set on '" + node_path + "' in '" + params.scene_path + "'")
+
+# Inspect a saved scene and emit a JSON dump of the node tree with each node's
+# name, type, path, child count, and (optionally) a small sample of its
+# non-default properties.
+func list_scene_nodes(params):
+    print("Listing nodes in scene: " + params.scene_path)
+
+    var full_scene_path = params.scene_path
+    if not full_scene_path.begins_with("res://"):
+        full_scene_path = "res://" + full_scene_path
+
+    if not FileAccess.file_exists(ProjectSettings.globalize_path(full_scene_path)):
+        printerr("Scene file does not exist at: " + full_scene_path)
+        quit(1)
+
+    var scene = load(full_scene_path)
+    if not scene:
+        printerr("Failed to load scene: " + full_scene_path)
+        quit(1)
+
+    var scene_root = scene.instantiate()
+    var include_properties = false
+    if params.has("include_properties"):
+        include_properties = bool(params.include_properties)
+
+    var tree = _describe_node(scene_root, "root", include_properties)
+    var json_text = JSON.stringify(tree, "  ")
+    # Stable marker so the TypeScript side can locate the JSON payload reliably.
+    print("---NODES-JSON-BEGIN---")
+    print(json_text)
+    print("---NODES-JSON-END---")
+
+func _describe_node(node, path, include_properties):
+    var entry = {
+        "name": String(node.name),
+        "type": node.get_class(),
+        "path": path,
+        "child_count": node.get_child_count()
+    }
+    if include_properties:
+        var props = {}
+        for info in node.get_property_list():
+            if not (info.usage & PROPERTY_USAGE_STORAGE):
+                continue
+            var name = info.name
+            if name == "script":
+                continue
+            var value = node.get(name)
+            # Skip Resource/object/array values to keep output compact and JSON-safe.
+            var t = typeof(value)
+            if t == TYPE_OBJECT or t == TYPE_ARRAY or t == TYPE_DICTIONARY:
+                continue
+            props[name] = str(value)
+        entry["properties"] = props
+    var children = []
+    for child in node.get_children():
+        var child_path = path + "/" + String(child.name)
+        children.append(_describe_node(child, child_path, include_properties))
+    entry["children"] = children
+    return entry
 
 # Load a sprite into a Sprite2D node
 func load_sprite(params):

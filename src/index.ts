@@ -82,6 +82,9 @@ class GodotServer {
     'node_name': 'nodeName',
     'texture_path': 'texturePath',
     'node_path': 'nodePath',
+    'include_properties': 'includeProperties',
+    'property': 'property',
+    'value': 'value',
     'output_path': 'outputPath',
     'mesh_item_names': 'meshItemNames',
     'new_path': 'newPath',
@@ -808,10 +811,61 @@ class GodotServer {
               },
               properties: {
                 type: 'object',
-                description: 'Optional properties to set on the node',
+                description: 'Optional properties to set on the node. Values may be: a scalar (string/number/bool); a "res://..." path (loaded as a Resource); a math directive {"_type":"Vector3","_args":[x,y,z]} (supports Vector2/2i/3/3i/4, Color, Quaternion, Plane, Rect2/2i, Basis, Transform2D, Transform3D, NodePath); or a sub-resource directive {"_type":"BoxShape3D","_props":{...}} which instantiates the class via ClassDB and recursively coerces each property. Example: {"shape": {"_type":"BoxShape3D","_props":{"size":{"_type":"Vector3","_args":[2,1,2]}}}}.',
               },
             },
             required: ['projectPath', 'scenePath', 'nodeType', 'nodeName'],
+          },
+        },
+        {
+          name: 'set_node_property',
+          description: 'Set a single property on an existing node in a saved scene. Uses the same value-coercion grammar as add_node.properties (scalars, "res://" loads, {_type,_args} math types, {_type,_props} sub-resources).',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              projectPath: {
+                type: 'string',
+                description: 'Path to the Godot project directory',
+              },
+              scenePath: {
+                type: 'string',
+                description: 'Path to the scene file (relative to project)',
+              },
+              nodePath: {
+                type: 'string',
+                description: 'Path to the target node within the scene (e.g., "root", "root/Ground", or "Ground"). Defaults to the scene root.',
+              },
+              property: {
+                type: 'string',
+                description: 'Name of the property to set (snake_case as exposed by Godot, e.g. "transform", "shadow_enabled", "shape").',
+              },
+              value: {
+                description: 'Value to assign. Same shape as values inside add_node.properties: scalar, "res://..." string, {"_type":"...","_args":[...]} math directive, or {"_type":"...","_props":{...}} sub-resource directive.',
+              },
+            },
+            required: ['projectPath', 'scenePath', 'property'],
+          },
+        },
+        {
+          name: 'list_scene_nodes',
+          description: 'List the node tree of a saved scene. Returns JSON with each node\'s name, type, path, child count, and optionally a sample of its storage properties.',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              projectPath: {
+                type: 'string',
+                description: 'Path to the Godot project directory',
+              },
+              scenePath: {
+                type: 'string',
+                description: 'Path to the scene file (relative to project)',
+              },
+              includeProperties: {
+                type: 'boolean',
+                description: 'When true, include a compact dict of each node\'s non-Object storage properties. Resources, Arrays, and Dictionaries are omitted to keep the payload small.',
+              },
+            },
+            required: ['projectPath', 'scenePath'],
           },
         },
         {
@@ -948,6 +1002,10 @@ class GodotServer {
           return await this.handleCreateScene(request.params.arguments);
         case 'add_node':
           return await this.handleAddNode(request.params.arguments);
+        case 'set_node_property':
+          return await this.handleSetNodeProperty(request.params.arguments);
+        case 'list_scene_nodes':
+          return await this.handleListSceneNodes(request.params.arguments);
         case 'load_sprite':
           return await this.handleLoadSprite(request.params.arguments);
         case 'export_mesh_library':
@@ -1657,6 +1715,166 @@ class GodotServer {
           'Check if the GODOT_PATH environment variable is set correctly',
           'Verify the project path is accessible',
         ]
+      );
+    }
+  }
+
+  /**
+   * Handle the set_node_property tool
+   */
+  private async handleSetNodeProperty(args: any) {
+    args = this.normalizeParameters(args);
+
+    if (!args.projectPath || !args.scenePath || !args.property) {
+      return this.createErrorResponse(
+        'Missing required parameters',
+        ['Provide projectPath, scenePath, and property (nodePath defaults to the scene root)']
+      );
+    }
+
+    if (!this.validatePath(args.projectPath) || !this.validatePath(args.scenePath)) {
+      return this.createErrorResponse(
+        'Invalid path',
+        ['Provide valid paths without ".." or other potentially unsafe characters']
+      );
+    }
+
+    try {
+      const projectFile = join(args.projectPath, 'project.godot');
+      if (!existsSync(projectFile)) {
+        return this.createErrorResponse(
+          `Not a valid Godot project: ${args.projectPath}`,
+          ['Ensure the path points to a directory containing a project.godot file']
+        );
+      }
+
+      const scenePath = join(args.projectPath, args.scenePath);
+      if (!existsSync(scenePath)) {
+        return this.createErrorResponse(
+          `Scene file does not exist: ${args.scenePath}`,
+          ['Ensure the scene path is correct']
+        );
+      }
+
+      const params: any = {
+        scenePath: args.scenePath,
+        property: args.property,
+        value: args.value,
+      };
+      if (args.nodePath) {
+        params.nodePath = args.nodePath;
+      }
+
+      const { stdout, stderr } = await this.executeOperation('set_node_property', params, args.projectPath);
+
+      if (stderr && stderr.includes('Failed to')) {
+        return this.createErrorResponse(
+          `Failed to set property: ${stderr}`,
+          [
+            'Check if the node path resolves inside the scene',
+            'Verify the property name is exposed by the target node',
+            'For sub-resources, use {"_type": "...", "_props": {...}} value shape',
+          ]
+        );
+      }
+
+      return {
+        content: [
+          {
+            type: 'text',
+            text: `Property '${args.property}' set on '${args.nodePath || 'root'}' in '${args.scenePath}'.\n\nOutput: ${stdout}`,
+          },
+        ],
+      };
+    } catch (error: any) {
+      return this.createErrorResponse(
+        `Failed to set node property: ${error?.message || 'Unknown error'}`,
+        ['Ensure Godot is installed correctly', 'Verify GODOT_PATH']
+      );
+    }
+  }
+
+  /**
+   * Handle the list_scene_nodes tool
+   */
+  private async handleListSceneNodes(args: any) {
+    args = this.normalizeParameters(args);
+
+    if (!args.projectPath || !args.scenePath) {
+      return this.createErrorResponse(
+        'Missing required parameters',
+        ['Provide projectPath and scenePath']
+      );
+    }
+
+    if (!this.validatePath(args.projectPath) || !this.validatePath(args.scenePath)) {
+      return this.createErrorResponse(
+        'Invalid path',
+        ['Provide valid paths without ".." or other potentially unsafe characters']
+      );
+    }
+
+    try {
+      const projectFile = join(args.projectPath, 'project.godot');
+      if (!existsSync(projectFile)) {
+        return this.createErrorResponse(
+          `Not a valid Godot project: ${args.projectPath}`,
+          ['Ensure the path points to a directory containing a project.godot file']
+        );
+      }
+
+      const scenePath = join(args.projectPath, args.scenePath);
+      if (!existsSync(scenePath)) {
+        return this.createErrorResponse(
+          `Scene file does not exist: ${args.scenePath}`,
+          ['Ensure the scene path is correct']
+        );
+      }
+
+      const params: any = { scenePath: args.scenePath };
+      if (args.includeProperties !== undefined) {
+        params.includeProperties = args.includeProperties;
+      }
+
+      const { stdout, stderr } = await this.executeOperation('list_scene_nodes', params, args.projectPath);
+
+      if (stderr && stderr.includes('Failed to')) {
+        return this.createErrorResponse(
+          `Failed to list nodes: ${stderr}`,
+          ['Verify the scene file is valid']
+        );
+      }
+
+      const beginMarker = '---NODES-JSON-BEGIN---';
+      const endMarker = '---NODES-JSON-END---';
+      const beginIdx = stdout.indexOf(beginMarker);
+      const endIdx = stdout.indexOf(endMarker);
+      let tree: any = null;
+      if (beginIdx !== -1 && endIdx !== -1 && endIdx > beginIdx) {
+        const jsonText = stdout.substring(beginIdx + beginMarker.length, endIdx).trim();
+        try {
+          tree = JSON.parse(jsonText);
+        } catch (parseErr: any) {
+          return this.createErrorResponse(
+            `Failed to parse node tree JSON: ${parseErr?.message || 'unknown'}`,
+            ['Raw output may contain non-JSON noise; check the GDScript output']
+          );
+        }
+      }
+
+      const payload = tree ? JSON.stringify(tree, null, 2) : stdout;
+      return {
+        content: [
+          {
+            type: 'text',
+            text: `Node tree for '${args.scenePath}':\n\n${payload}`,
+          },
+        ],
+      };
+    } catch (error: any) {
+      return this.createErrorResponse(
+        `Failed to list scene nodes: ${error?.message || 'Unknown error'}`,
+        ['Ensure Godot is installed correctly', 'Verify GODOT_PATH']
       );
     }
   }
