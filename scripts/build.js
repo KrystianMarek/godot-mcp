@@ -19,8 +19,18 @@ try {
     path.join(__dirname, '..', 'src', 'scripts', 'godot_operations.gd'),
     path.join(__dirname, '..', 'build', 'scripts', 'godot_operations.gd')
   );
-  
-  console.log('Successfully copied godot_operations.gd to build/scripts');
+
+  // Copy the capture_screenshot runner assets
+  fs.copyFileSync(
+    path.join(__dirname, '..', 'src', 'scripts', 'capture_runner.gd'),
+    path.join(__dirname, '..', 'build', 'scripts', 'capture_runner.gd')
+  );
+  fs.copyFileSync(
+    path.join(__dirname, '..', 'src', 'scripts', 'capture_runner.tscn'),
+    path.join(__dirname, '..', 'build', 'scripts', 'capture_runner.tscn')
+  );
+
+  console.log('Successfully copied godot_operations.gd and capture_runner.{gd,tscn} to build/scripts');
 } catch (error) {
   console.error('Error copying scripts:', error);
   process.exit(1);

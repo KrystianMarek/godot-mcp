@@ -9,9 +9,10 @@
 
 import { fileURLToPath } from 'url';
 import { join, dirname, basename, normalize } from 'path';
-import { existsSync, readdirSync, mkdirSync } from 'fs';
+import { existsSync, readdirSync, mkdirSync, copyFileSync, readFileSync, writeFileSync } from 'fs';
 import { spawn, execFile } from 'child_process';
 import { promisify } from 'util';
+import { tmpdir } from 'os';
 
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
@@ -92,6 +93,11 @@ class GodotServer {
     'directory': 'directory',
     'recursive': 'recursive',
     'scene': 'scene',
+    'warmup_frames': 'warmupFrames',
+    'camera_node_path': 'cameraNodePath',
+    'timeout_seconds': 'timeoutSeconds',
+    'width': 'width',
+    'height': 'height',
   };
 
   /**
@@ -977,6 +983,48 @@ class GodotServer {
             required: ['projectPath'],
           },
         },
+        {
+          name: 'capture_screenshot',
+          description: 'Capture a PNG screenshot of a scene in a Godot project. Runs the scene in native window mode (no --headless), waits a configurable number of rendered frames so physics/animation/camera lerp can settle, then exports the viewport texture to PNG. Returns the image inline as MCP image content alongside a textual summary.',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              projectPath: {
+                type: 'string',
+                description: 'Path to the Godot project directory.',
+              },
+              scenePath: {
+                type: 'string',
+                description: 'Path to the scene to capture, relative to the project (e.g. "scenes/main.tscn"). Will be passed to Godot as "res://<scenePath>".',
+              },
+              outputPath: {
+                type: 'string',
+                description: 'Optional: absolute filesystem path where the PNG should be saved. Defaults to a temp file under the OS temp dir. The image is also returned inline regardless of where it is saved.',
+              },
+              width: {
+                type: 'number',
+                description: 'Optional: viewport / window width in pixels (default 1280).',
+              },
+              height: {
+                type: 'number',
+                description: 'Optional: viewport / window height in pixels (default 720).',
+              },
+              warmupFrames: {
+                type: 'number',
+                description: 'Optional: number of frames to render before capturing (default 10). Higher values let physics, animation, and camera lerp settle.',
+              },
+              cameraNodePath: {
+                type: 'string',
+                description: 'Optional: NodePath of a Camera2D/Camera3D inside the target scene to make current before capture. Resolved relative to the scene root.',
+              },
+              timeoutSeconds: {
+                type: 'number',
+                description: 'Optional: hard timeout for the Godot process (default 30). The capture is aborted with an error if exceeded.',
+              },
+            },
+            required: ['projectPath', 'scenePath'],
+          },
+        },
       ],
     }));
 
@@ -1016,6 +1064,8 @@ class GodotServer {
           return await this.handleGetUid(request.params.arguments);
         case 'update_project_uids':
           return await this.handleUpdateProjectUids(request.params.arguments);
+        case 'capture_screenshot':
+          return await this.handleCaptureScreenshot(request.params.arguments);
         default:
           throw new McpError(
             ErrorCode.MethodNotFound,
@@ -2384,6 +2434,249 @@ class GodotServer {
         ]
       );
     }
+  }
+
+  /**
+   * Install (or refresh) the capture_runner addon inside the user's project.
+   * Returns the relative addon directory path on success.
+   */
+  private installCaptureRunner(projectPath: string): string {
+    const addonDir = join(projectPath, 'addons', 'godot_mcp_capture');
+    mkdirSync(addonDir, { recursive: true });
+
+    const srcRunnerGd = join(__dirname, 'scripts', 'capture_runner.gd');
+    const srcRunnerTscn = join(__dirname, 'scripts', 'capture_runner.tscn');
+
+    if (!existsSync(srcRunnerGd) || !existsSync(srcRunnerTscn)) {
+      throw new Error(
+        `capture_runner assets missing under ${join(__dirname, 'scripts')} — rebuild godot-mcp (npm run build).`
+      );
+    }
+
+    copyFileSync(srcRunnerGd, join(addonDir, 'capture_runner.gd'));
+    copyFileSync(srcRunnerTscn, join(addonDir, 'capture_runner.tscn'));
+
+    // Drop a .gdignore so Godot's resource importer leaves the directory alone
+    // and so callers can safely .gitignore the whole addon path if they wish.
+    const gdignore = join(addonDir, '.gdignore');
+    if (!existsSync(gdignore)) {
+      writeFileSync(gdignore, '');
+    }
+
+    return addonDir;
+  }
+
+  /**
+   * Handle the capture_screenshot tool
+   * @param args Tool arguments
+   */
+  private async handleCaptureScreenshot(args: any) {
+    args = this.normalizeParameters(args);
+
+    if (!args.projectPath) {
+      return this.createErrorResponse(
+        'Project path is required',
+        ['Provide a valid path to a Godot project directory']
+      );
+    }
+    if (!args.scenePath) {
+      return this.createErrorResponse(
+        'Scene path is required',
+        ['Provide a project-relative path such as "scenes/main.tscn"']
+      );
+    }
+
+    if (!this.validatePath(args.projectPath)) {
+      return this.createErrorResponse(
+        'Invalid project path',
+        ['Provide a valid path without ".." or other potentially unsafe characters']
+      );
+    }
+    if (!this.validatePath(args.scenePath)) {
+      return this.createErrorResponse(
+        'Invalid scene path',
+        ['Provide a valid project-relative scene path without ".." or absolute prefixes']
+      );
+    }
+
+    const projectFile = join(args.projectPath, 'project.godot');
+    if (!existsSync(projectFile)) {
+      return this.createErrorResponse(
+        `Not a valid Godot project: ${args.projectPath}`,
+        ['Ensure the path points to a directory containing a project.godot file']
+      );
+    }
+
+    const sceneFile = join(args.projectPath, args.scenePath);
+    if (!existsSync(sceneFile)) {
+      return this.createErrorResponse(
+        `Scene not found: ${sceneFile}`,
+        ['Provide a scenePath relative to the project that resolves to an existing .tscn / .scn file']
+      );
+    }
+
+    if (!this.godotPath) {
+      await this.detectGodotPath();
+      if (!this.godotPath) {
+        return this.createErrorResponse(
+          'Could not find a valid Godot executable path',
+          [
+            'Ensure Godot is installed correctly',
+            'Set GODOT_PATH environment variable to specify the correct path',
+          ]
+        );
+      }
+    }
+
+    // Resolve options with defaults
+    const width: number = typeof args.width === 'number' && args.width > 0 ? Math.floor(args.width) : 1280;
+    const height: number = typeof args.height === 'number' && args.height > 0 ? Math.floor(args.height) : 720;
+    const warmupFrames: number =
+      typeof args.warmupFrames === 'number' && args.warmupFrames > 0 ? Math.floor(args.warmupFrames) : 10;
+    const timeoutSeconds: number =
+      typeof args.timeoutSeconds === 'number' && args.timeoutSeconds > 0 ? Math.floor(args.timeoutSeconds) : 30;
+    const outputPath: string =
+      typeof args.outputPath === 'string' && args.outputPath.length > 0
+        ? args.outputPath
+        : join(tmpdir(), `godot-mcp-shot-${Date.now()}.png`);
+
+    let addonDir: string;
+    try {
+      addonDir = this.installCaptureRunner(args.projectPath);
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      return this.createErrorResponse(
+        `Failed to install capture_runner addon: ${msg}`,
+        [
+          'Rebuild godot-mcp (`npm run build`) so build/scripts/ contains capture_runner.gd and capture_runner.tscn',
+          'Ensure the project directory is writable',
+        ]
+      );
+    }
+
+    const runnerScene = 'res://addons/godot_mcp_capture/capture_runner.tscn';
+    const sceneResUri = `res://${args.scenePath.replace(/^\/+/, '')}`;
+
+    // NOTE: no --headless here (ADR-0002). Godot must produce a real framebuffer.
+    const cmdArgs: string[] = [
+      '--path',
+      args.projectPath,
+      '--resolution',
+      `${width}x${height}`,
+      runnerScene,
+      '--',
+      '--target-scene',
+      sceneResUri,
+      '--out-path',
+      outputPath,
+      '--warmup-frames',
+      String(warmupFrames),
+    ];
+    if (typeof args.cameraNodePath === 'string' && args.cameraNodePath.length > 0) {
+      cmdArgs.push('--camera-node', args.cameraNodePath);
+    }
+
+    this.logDebug(`capture_screenshot: ${this.godotPath} ${cmdArgs.join(' ')}`);
+
+    let stdout = '';
+    let stderr = '';
+    let timedOut = false;
+
+    try {
+      const result = await new Promise<{ stdout: string; stderr: string; code: number | null }>((resolve, reject) => {
+        const child = spawn(this.godotPath!, cmdArgs, { stdio: 'pipe' });
+        const out: string[] = [];
+        const err: string[] = [];
+
+        const timer = setTimeout(() => {
+          timedOut = true;
+          try { child.kill('SIGKILL'); } catch { /* ignore */ }
+        }, timeoutSeconds * 1000);
+
+        child.stdout?.on('data', (d: Buffer) => out.push(d.toString()));
+        child.stderr?.on('data', (d: Buffer) => err.push(d.toString()));
+        child.on('error', (e: Error) => {
+          clearTimeout(timer);
+          reject(e);
+        });
+        child.on('exit', (code: number | null) => {
+          clearTimeout(timer);
+          resolve({ stdout: out.join(''), stderr: err.join(''), code });
+        });
+      });
+      stdout = result.stdout;
+      stderr = result.stderr;
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      return this.createErrorResponse(
+        `Failed to spawn Godot for capture: ${msg}`,
+        ['Verify the Godot binary at GODOT_PATH is executable', 'Check that no other capture is in progress']
+      );
+    }
+
+    if (timedOut) {
+      return this.createErrorResponse(
+        `capture_screenshot timed out after ${timeoutSeconds}s`,
+        [
+          'Increase timeoutSeconds for slow-loading scenes',
+          'Reduce warmupFrames if the scene is static',
+          `stdout: ${stdout.trim().slice(-500)}`,
+          `stderr: ${stderr.trim().slice(-500)}`,
+        ]
+      );
+    }
+
+    if (stdout.includes('CAPTURE_RESULT_ERR')) {
+      const reason = (stdout.match(/CAPTURE_RESULT_ERR\s+(.*)/) || [])[1] || 'unknown';
+      return this.createErrorResponse(
+        `capture_screenshot failed inside Godot: ${reason.trim()}`,
+        [
+          'Verify the scenePath loads without errors when opened in the editor',
+          'If cameraNodePath was supplied, confirm it resolves inside the scene',
+          `stdout: ${stdout.trim().slice(-500)}`,
+        ]
+      );
+    }
+
+    if (!stdout.includes('CAPTURE_RESULT_OK') || !existsSync(outputPath)) {
+      return this.createErrorResponse(
+        `capture_screenshot did not produce a PNG at ${outputPath}`,
+        [
+          'Ensure the host has a display server (X11/Wayland/Quartz/Win32) — Godot needs a real rendering context',
+          'Try running `scripts/godot.sh --path <project> <scene>` manually to confirm the scene starts',
+          `stdout: ${stdout.trim().slice(-500)}`,
+          `stderr: ${stderr.trim().slice(-500)}`,
+        ]
+      );
+    }
+
+    let pngBase64: string;
+    try {
+      const buf = readFileSync(outputPath);
+      pngBase64 = buf.toString('base64');
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      return this.createErrorResponse(
+        `Captured PNG could not be read at ${outputPath}: ${msg}`,
+        ['Check filesystem permissions for the output path']
+      );
+    }
+
+    return {
+      content: [
+        {
+          type: 'text',
+          text:
+            `Captured ${width}x${height} screenshot of res://${args.scenePath} ` +
+            `after ${warmupFrames} warmup frames. PNG saved to ${outputPath}.`,
+        },
+        {
+          type: 'image',
+          data: pngBase64,
+          mimeType: 'image/png',
+        },
+      ],
+    };
   }
 
   /**
